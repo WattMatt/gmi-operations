@@ -30,7 +30,7 @@ const detailStr = (v: unknown): string => (v == null ? '' : String(v));
 const isFlagged = (c: unknown) => c === 'poor' || c === 'critical';
 
 export default function ConditionInspectionSection({ reportId, buildingId, readOnly }: SectionProps) {
-  const { items, responses, isLoading, setResponse } = useInspectionSection(reportId, buildingId, 'annual');
+  const { items, responses, isLoading, setResponse } = useInspectionSection(reportId, buildingId, 'annual', readOnly);
   const [active, setActive] = useState<string | null>(null);
 
   const addPhoto = async (it: InspectionTemplateItem, file: File) => {
@@ -198,7 +198,7 @@ export default function ConditionInspectionSection({ reportId, buildingId, readO
   return (
     <SectionCard
       title="Condition Inspection"
-      hint="Annual inspection across 33 sections. Pick a section; each item shows its own field set plus condition, recommendation and capex."
+      hint="Annual inspection across 33 sections. Pick a section; each item shows its own field set plus condition, recommendation and capex. Changes save automatically, and photos you attach print in the exported PDF."
       headerAccessory={totalFlagged > 0 ? <Badge variant="destructive">{totalFlagged} flagged</Badge> : undefined}
     >
       {isLoading ? (

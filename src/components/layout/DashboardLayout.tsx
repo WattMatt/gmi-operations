@@ -5,6 +5,10 @@ import { useOrganization } from '@/hooks/useOrganization';
 import { useUserProfile } from '@/hooks/useUserProfile';
 import { recordAuthEvent } from '@/lib/auth-audit';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { HintsToggle } from '@/components/HintsToggle';
+import { NotificationBell } from '@/components/notifications/NotificationBell';
+import { useNotifications, useNotificationsRealtime } from '@/hooks/useNotifications';
+import type { NotificationKind } from '@/lib/notify';
 import {
   Sidebar,
   SidebarContent,
@@ -40,8 +44,10 @@ import {
   ChevronDown,
   MapPin,
   BarChart3,
+  FileText,
   FileSpreadsheet,
   PenLine,
+  Sun,
   User,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -51,13 +57,25 @@ interface NavItem {
   href: string;
   icon: ReactNode;
   roles?: ('admin' | 'manager' | 'user' | 'reviewer')[];
+  /** Unread notifications of these kinds show as a count beside the item. */
+  badgeKinds?: NotificationKind[];
 }
 
 const mainNavItems: NavItem[] = [
   {
+    // First, because for site roles it is the only page they need most days.
+    title: 'My Day',
+    href: '/my-day',
+    icon: <Sun className="w-4 h-4" />,
+  },
+  {
+    // `/` renders the portfolio dashboard for admins and managers and redirects everyone
+    // else to /my-day, so for a site role this entry is a second door to the page above it.
+    // Hiding it keeps one destination per control.
     title: 'Dashboard',
     href: '/',
     icon: <LayoutDashboard className="w-4 h-4" />,
+    roles: ['admin', 'manager'],
   },
   {
     title: 'Buildings',
@@ -73,6 +91,7 @@ const mainNavItems: NavItem[] = [
     title: 'Issues',
     href: '/issues',
     icon: <AlertTriangle className="w-4 h-4" />,
+    badgeKinds: ['issue_assigned', 'issue_comment', 'issue_mention'],
   },
   {
     title: 'Map View',
@@ -83,11 +102,22 @@ const mainNavItems: NavItem[] = [
     title: 'My Sign-offs',
     href: '/my-signoffs',
     icon: <PenLine className="w-4 h-4" />,
+    badgeKinds: ['signoff_requested', 'signoff_overdue'],
   },
 ];
 
 const reportsNavItems: NavItem[] = [
   {
+    // The monthly OPS/CM and annual reports themselves. Previously reachable only by
+    // opening a building and finding its Reports tab, which meant no way to see a month
+    // across the portfolio at all.
+    title: 'Building Reports',
+    href: '/reports/fortress',
+    icon: <FileText className="w-4 h-4" />,
+    badgeKinds: ['report_submitted', 'report_returned', 'report_approved'],
+  },
+  {
+    // Note: a different thing — H&S scoring and PDF evidence packs, not the reports above.
     title: 'Compliance Reports',
     href: '/reports',
     icon: <BarChart3 className="w-4 h-4" />,
@@ -119,10 +149,27 @@ interface DashboardLayoutProps {
   children: ReactNode;
 }
 
+/** The unread pill beside a nav item. */
+function NavBadge({ count }: { count: number }) {
+  return (
+    <span className="ml-auto rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground">
+      <span aria-hidden="true">{count}</span>
+      <span className="sr-only">{count} unread</span>
+    </span>
+  );
+}
+
 export default function DashboardLayout({ children }: DashboardLayoutProps) {
-  const { user, role, signOut } = useAuth();
+  const { user, role, signOut, isAdminOrManager } = useAuth();
   const { organization } = useOrganization();
   const { profile } = useUserProfile();
+  // Signed-out renders are possible (the layout mounts before the session resolves);
+  // the hook is enabled only when there is a user, so this is a no-op count of 0.
+  const { unreadByKind } = useNotifications();
+  // The one owner of the notifications realtime channel. It belongs here because the layout
+  // persists across routes; opening a second channel on the same topic from the bell or the
+  // inbox page breaks live updates for everyone (see useNotificationsRealtime).
+  useNotificationsRealtime();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -175,19 +222,23 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               <SidebarGroupLabel>Main</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {mainNavItems.map((item) => (
-                    <SidebarMenuItem key={item.href}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={location.pathname === item.href}
-                      >
-                        <Link to={item.href}>
-                          {item.icon}
-                          <span>{item.title}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                  {mainNavItems.filter(canAccessItem).map((item) => {
+                    const n = item.badgeKinds ? unreadByKind(item.badgeKinds) : 0;
+                    return (
+                      <SidebarMenuItem key={item.href}>
+                        <SidebarMenuButton
+                          asChild
+                          isActive={location.pathname === item.href}
+                        >
+                          <Link to={item.href}>
+                            {item.icon}
+                            <span>{item.title}</span>
+                            {n > 0 && <NavBadge count={n} />}
+                          </Link>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })}
                 </SidebarMenu>
               </SidebarGroupContent>
             </SidebarGroup>
@@ -196,19 +247,23 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               <SidebarGroupLabel>Reports & Audit</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {reportsNavItems.filter(canAccessItem).map((item) => (
-                    <SidebarMenuItem key={item.href}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={location.pathname === item.href}
-                      >
-                        <Link to={item.href}>
-                          {item.icon}
-                          <span>{item.title}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                  {reportsNavItems.filter(canAccessItem).map((item) => {
+                    const n = item.badgeKinds ? unreadByKind(item.badgeKinds) : 0;
+                    return (
+                      <SidebarMenuItem key={item.href}>
+                        <SidebarMenuButton
+                          asChild
+                          isActive={location.pathname === item.href}
+                        >
+                          <Link to={item.href}>
+                            {item.icon}
+                            <span>{item.title}</span>
+                            {n > 0 && <NavBadge count={n} />}
+                          </Link>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })}
                 </SidebarMenu>
               </SidebarGroupContent>
             </SidebarGroup>
@@ -217,19 +272,23 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               <SidebarGroupLabel>Administration</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {adminNavItems.filter(canAccessItem).map((item) => (
-                    <SidebarMenuItem key={item.href}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={location.pathname === item.href}
-                      >
-                        <Link to={item.href}>
-                          {item.icon}
-                          <span>{item.title}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                    </SidebarMenuItem>
-                  ))}
+                  {adminNavItems.filter(canAccessItem).map((item) => {
+                    const n = item.badgeKinds ? unreadByKind(item.badgeKinds) : 0;
+                    return (
+                      <SidebarMenuItem key={item.href}>
+                        <SidebarMenuButton
+                          asChild
+                          isActive={location.pathname === item.href}
+                        >
+                          <Link to={item.href}>
+                            {item.icon}
+                            <span>{item.title}</span>
+                            {n > 0 && <NavBadge count={n} />}
+                          </Link>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })}
                 </SidebarMenu>
               </SidebarGroupContent>
             </SidebarGroup>
@@ -268,10 +327,12 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
                   <User className="w-4 h-4 mr-2" />
                   My Profile
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate('/settings')}>
-                  <Settings className="w-4 h-4 mr-2" />
-                  Settings
-                </DropdownMenuItem>
+                {isAdminOrManager && (
+                  <DropdownMenuItem onClick={() => navigate('/settings')}>
+                    <Settings className="w-4 h-4 mr-2" />
+                    Settings
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={handleSignOut}
@@ -288,7 +349,11 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
         <main className="flex-1 flex flex-col min-w-0">
           <header className="h-12 sm:h-14 border-b bg-card flex items-center justify-between px-3 sm:px-4 shrink-0">
             <SidebarTrigger />
-            <ThemeToggle />
+            <div className="flex items-center gap-1">
+              <NotificationBell />
+              <HintsToggle />
+              <ThemeToggle />
+            </div>
           </header>
           <div className="flex-1 p-3 sm:p-4 lg:p-6 overflow-auto">
             {children}

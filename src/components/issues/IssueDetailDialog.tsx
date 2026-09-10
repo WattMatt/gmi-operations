@@ -9,6 +9,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import {
   Select,
@@ -22,6 +23,12 @@ import { Building2, Calendar, Clock, Loader2, UserCircle2, ArrowRight, Plus } fr
 import { format } from 'date-fns';
 import { toast } from 'sonner';
 import type { IssuePriority, IssueStatus } from '@/lib/constants';
+import { useBuildingMembers, memberDisplayName } from '@/hooks/useBuildingMembers';
+import { AssigneePicker } from '@/components/people/AssigneePicker';
+import { IssueCommentComposer } from '@/components/issues/IssueCommentComposer';
+import { ResolveIssueDialog } from '@/components/issues/ResolveIssueDialog';
+import { notify } from '@/lib/notify';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface Issue {
   id: string;
@@ -48,6 +55,9 @@ interface Activity {
   comment: string | null;
   author_name: string | null;
   created_at: string;
+  user_id: string | null;
+  photo_urls: string[] | null;
+  mentions: string[] | null;
 }
 
 const statusColors: Record<IssueStatus, string> = {
@@ -73,36 +83,32 @@ interface Props {
 }
 
 export default function IssueDetailDialog({ issue, open, onOpenChange, canManage, onUpdated }: Props) {
+  const { user } = useAuth();
+  const { byId: members } = useBuildingMembers(issue.building_id);
+  const nameOf = (id: string | null | undefined) => (id && members.get(id) ? memberDisplayName(members.get(id)!) : null);
   const [activity, setActivity] = useState<Activity[]>([]);
-  const [people, setPeople] = useState<Record<string, string>>({});
-  const [assignable, setAssignable] = useState<{ id: string; name: string }[]>([]);
+  const [activityError, setActivityError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [savingStatus, setSavingStatus] = useState(false);
   const [savingAssignee, setSavingAssignee] = useState(false);
+  const [resolveOpen, setResolveOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [{ data: acts }, { data: profs }] = await Promise.all([
-        supabase
-          .from('issue_activity')
-          .select('id, activity_type, old_value, new_value, comment, author_name, created_at')
-          .eq('issue_id', issue.id)
-          .order('created_at', { ascending: true }),
-        // Assignable people = anyone with access to this building (admin/manager
-        // see all; the picker is only shown to managers anyway).
-        supabase.from('profiles').select('id, full_name, email'),
-      ]);
-      setActivity((acts as Activity[]) ?? []);
-      const map: Record<string, string> = {};
-      const list: { id: string; name: string }[] = [];
-      for (const p of profs ?? []) {
-        const name = (p.full_name as string) || (p.email as string) || 'Unknown';
-        map[p.id as string] = name;
-        list.push({ id: p.id as string, name });
+      const { data: acts, error } = await supabase
+        .from('issue_activity')
+        .select('id, activity_type, old_value, new_value, comment, author_name, created_at, user_id, photo_urls, mentions')
+        .eq('issue_id', issue.id)
+        .order('created_at', { ascending: true });
+      if (error) {
+        if (import.meta.env.DEV) console.error('Load issue history failed:', error);
+        setActivityError(error.message || 'Could not load the history.');
+        return;
       }
-      setPeople(map);
-      setAssignable(list.sort((a, b) => a.name.localeCompare(b.name)));
+      setActivityError(null);
+      // photo_urls is jsonb (typed Json); the app only ever writes string[] there.
+      setActivity((acts ?? []) as Activity[]);
     } finally {
       setLoading(false);
     }
@@ -115,10 +121,15 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
   // The issues trigger logs the change to issue_activity automatically.
   const changeStatus = async (status: IssueStatus) => {
     if (status === issue.status) return;
+    if (status === 'resolved') {
+      setResolveOpen(true);
+      return;
+    }
     setSavingStatus(true);
     try {
-      const { error } = await supabase.from('issues').update({ status }).eq('id', issue.id);
+      const { data, error } = await supabase.from('issues').update({ status }).eq('id', issue.id).select('id');
       if (error) throw error;
+      if (!data?.length) throw new Error('You do not have permission to change this issue.');
       toast.success(`Status changed to ${statusLabels[status]}`);
       onUpdated();
       await load();
@@ -129,14 +140,17 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
     }
   };
 
-  const changeAssignee = async (value: string) => {
-    const assigned_to = value === '__unassigned__' ? null : value;
+  const changeAssignee = async (assigned_to: string | null) => {
     if (assigned_to === issue.assigned_to) return;
     setSavingAssignee(true);
     try {
-      const { error } = await supabase.from('issues').update({ assigned_to }).eq('id', issue.id);
+      const { data, error } = await supabase.from('issues').update({ assigned_to }).eq('id', issue.id).select('id');
       if (error) throw error;
-      toast.success(assigned_to ? `Assigned to ${people[assigned_to] ?? 'user'}` : 'Unassigned');
+      if (!data?.length) throw new Error('You do not have permission to assign this issue.');
+      toast.success(assigned_to ? `Assigned to ${nameOf(assigned_to) ?? 'user'}` : 'Unassigned');
+      if (assigned_to && assigned_to !== user?.id) {
+        void notify({ kind: 'issue_assigned', entityType: 'issue', entityId: issue.id, buildingId: issue.building_id, recipients: [assigned_to], title: `Issue assigned to you: ${issue.title}`, url: `/issues?open=${issue.id}` });
+      }
       onUpdated();
       await load();
     } catch (e) {
@@ -154,12 +168,12 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
         return `changed status ${statusLabels[a.old_value as IssueStatus] ?? a.old_value} → ${statusLabels[a.new_value as IssueStatus] ?? a.new_value}`;
       case 'assignment':
         return a.new_value
-          ? `assigned to ${people[a.new_value] ?? 'a user'}`
+          ? `assigned to ${nameOf(a.new_value) ?? 'a user'}`
           : 'removed the assignee';
       case 'contractor_assignment':
         return `assigned contractor ${a.new_value ?? ''}`.trim();
       case 'comment':
-        return a.comment ?? 'commented';
+        return '';
       default:
         return a.activity_type;
     }
@@ -213,15 +227,7 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
               </div>
               <div className="space-y-1.5">
                 <Label className="text-xs">Assignee</Label>
-                <Select value={issue.assigned_to ?? '__unassigned__'} onValueChange={changeAssignee} disabled={savingAssignee}>
-                  <SelectTrigger><SelectValue placeholder="Unassigned" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__unassigned__">Unassigned</SelectItem>
-                    {assignable.map((p) => (
-                      <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <AssigneePicker buildingId={issue.building_id} value={issue.assigned_to} onChange={changeAssignee} disabled={savingAssignee} />
               </div>
             </div>
           )}
@@ -231,11 +237,18 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
             <Label className="text-xs text-muted-foreground">History</Label>
             {loading ? (
               <div className="flex justify-center py-4"><Loader2 className="h-4 w-4 animate-spin text-muted-foreground" /></div>
+            ) : activityError ? (
+              <div className="space-y-2 py-2">
+                <p className="text-xs text-destructive">Could not load the history.</p>
+                <Button size="sm" variant="outline" onClick={() => void load()}>Try again</Button>
+              </div>
             ) : activity.length === 0 ? (
               <p className="text-xs text-muted-foreground py-2">No history yet.</p>
             ) : (
               <ol className="mt-2 space-y-3">
-                {activity.map((a) => (
+                {activity.map((a) => {
+                  const mentionedNames = (a.mentions ?? []).map((id) => nameOf(id)).filter((n): n is string => !!n);
+                  return (
                   <li key={a.id} className="flex gap-2 text-sm">
                     <span className="mt-0.5 text-muted-foreground">
                       {a.activity_type === 'status_change' ? <ArrowRight className="h-4 w-4" />
@@ -246,14 +259,46 @@ export default function IssueDetailDialog({ issue, open, onOpenChange, canManage
                       <p>
                         <span className="font-medium">{a.author_name ?? 'Someone'}</span> {activityText(a)}
                       </p>
+                      {a.activity_type === 'comment' && a.comment && (
+                        <p className="whitespace-pre-wrap">{a.comment}</p>
+                      )}
+                      {a.photo_urls && a.photo_urls.length > 0 && (
+                        <div className="mt-1 flex gap-2 flex-wrap">
+                          {a.photo_urls.map((url, i) => (
+                            <SignedImage key={i} src={url} alt={`Comment photo ${i + 1}`} className="h-16 w-16 rounded-md object-cover border" />
+                          ))}
+                        </div>
+                      )}
+                      {mentionedNames.length > 0 && (
+                        <p className="text-xs text-muted-foreground">
+                          Mentioned: {mentionedNames.join(', ')}
+                        </p>
+                      )}
                       <p className="text-xs text-muted-foreground">{format(new Date(a.created_at), 'MMM d, yyyy • h:mm a')}</p>
                     </div>
                   </li>
-                ))}
+                  );
+                })}
               </ol>
             )}
+
+            <IssueCommentComposer
+              issueId={issue.id}
+              buildingId={issue.building_id}
+              issueTitle={issue.title}
+              reporterId={issue.reported_by}
+              assigneeId={issue.assigned_to}
+              onPosted={() => { void load(); onUpdated(); }}
+            />
           </div>
         </div>
+
+        <ResolveIssueDialog
+          issueId={issue.id}
+          open={resolveOpen}
+          onOpenChange={setResolveOpen}
+          onResolved={() => { onUpdated(); void load(); }}
+        />
       </DialogContent>
     </Dialog>
   );

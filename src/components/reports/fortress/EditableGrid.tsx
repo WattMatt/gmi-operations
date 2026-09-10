@@ -44,6 +44,7 @@ export function EditableGrid({ reportId, buildingId, readOnly, table, title, hin
   const { rows, isLoading, saveAll, isSaving } = useReportSection<Row>(table, reportId);
   const [draft, setDraft] = useState<Row[]>([]);
   const [dirty, setDirty] = useState(false);
+  // Reported to the editor via SectionCard (which this renders), so leaving/submitting warns first (D1).
 
   useEffect(() => { setDraft(rows.map((r) => ({ ...r }))); setDirty(false); }, [rows]);
 

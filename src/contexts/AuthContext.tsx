@@ -1,8 +1,9 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
 import { ROLE_PRECEDENCE, type AppRole } from '@/lib/constants';
 import { queryClient } from '@/lib/queryClient';
+import { identify, resetAnalytics } from '@/lib/analytics';
 
 export interface InviteUserPayload {
   email: string;
@@ -34,6 +35,9 @@ interface AuthContextType {
   onboardingCompleted: boolean;
   isRecovery: boolean;
   loading: boolean;
+  /** Re-run the role/profile fetch for the current session (M-8: a transient failure
+   *  must not read as a permissions problem, and the user needs a way to retry). */
+  refreshRole: () => Promise<void>;
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signUp: (email: string, password: string, fullName?: string) => Promise<{ error: Error | null }>;
   clearMustSetPassword: () => Promise<void>;
@@ -43,6 +47,7 @@ interface AuthContextType {
   resetPassword: (email: string) => Promise<{ error: Error | null }>;
   inviteUser: (payload: InviteUserPayload) => Promise<InviteUserResult>;
   setUserStatus: (userId: string, action: 'deactivate' | 'reactivate') => Promise<void>;
+  setUserRole: (userId: string, newRole: AppRole) => Promise<void>;
   isAdmin: boolean;
   isManager: boolean;
   isAdminOrManager: boolean;
@@ -60,6 +65,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [onboardingCompleted, setOnboardingCompleted] = useState(true);
   const [isRecovery, setIsRecovery] = useState(false);
   const [loading, setLoading] = useState(true);
+  /**
+   * Whether a signed-in session has been seen since this tab loaded. Supabase fires a
+   * no-session auth event on first load for a signed-out visitor too, and resetting there
+   * would rotate the anonymous PostHog distinct id on every cold start — orphaning the
+   * pre-login pageviews from the session they belong to. Only a session that actually
+   * ended is worth a reset.
+   */
+  const hadSessionRef = useRef(false);
 
   useEffect(() => {
     // Set up auth state listener FIRST
@@ -90,6 +103,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         // Defer role fetching to avoid deadlock
         if (session?.user) {
+          hadSessionRef.current = true;
           setTimeout(() => {
             fetchUserRole(session.user.id);
           }, 0);
@@ -99,6 +113,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAuthError(false);
           setMustSetPassword(false);
           setOnboardingCompleted(true);
+          // Sessions also end without going through signOut() — an expired or revoked
+          // token, or a sign-out in another tab. Drop the analytics identity here too,
+          // so the next person on this browser is not attributed to the outgoing user.
+          // Guarded on a session having actually existed: see hadSessionRef.
+          if (hadSessionRef.current) {
+            hadSessionRef.current = false;
+            resetAnalytics();
+          }
         }
       }
     );
@@ -108,6 +130,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSession(session);
       setUser(session?.user ?? null);
       if (session?.user) {
+        hadSessionRef.current = true;
         fetchUserRole(session.user.id);
       } else {
         setLoading(false);
@@ -149,6 +172,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setRoles(derived);
         setRole(derived[0] ?? null); // null (no role rows) => role-gated routes deny
         setAuthError(false);
+        // Product analytics identity: id + role only, never email or name.
+        identify(userId, { role: derived[0] ?? null });
       }
 
       // First-login + onboarding gates: read must_set_password and
@@ -174,6 +199,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setLoading(false);
     }
+  };
+
+  // M-8: lets a role-gated route retry after a transient user_roles fetch
+  // failure instead of leaving the user stuck behind a permanent-looking
+  // "Access Denied" screen.
+  const refreshRole = async () => {
+    if (!user?.id) return;
+    setLoading(true);
+    await fetchUserRole(user.id);
   };
 
   const signIn = async (email: string, password: string) => {
@@ -228,6 +262,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // E3: purge the query cache so the next user (or a signed-out window)
     // cannot see the outgoing user's cached data.
     queryClient.clear();
+    resetAnalytics();
     setUser(null);
     setSession(null);
     setRole(null);
@@ -280,6 +315,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  // Role changes go through an admin-verified edge function (never a raw client
+  // write), so the last-admin and self-demotion guards cannot be bypassed and a
+  // zero-row update can no longer report success.
+  const setUserRole = async (userId: string, newRole: AppRole) => {
+    const { error } = await supabase.functions.invoke('set-user-role', {
+      body: { userId, role: newRole },
+    });
+    if (error) {
+      let message = error.message || 'Failed to update user role';
+      try {
+        const body = await (error as { context?: Response }).context?.json?.();
+        if (body?.error) message = body.error;
+      } catch {
+        // keep the default message
+      }
+      throw new Error(message);
+    }
+  };
+
   const isAdmin = role === 'admin';
   const isManager = role === 'manager';
   const isAdminOrManager = isAdmin || isManager;
@@ -296,6 +350,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         onboardingCompleted,
         isRecovery,
         loading,
+        refreshRole,
         signIn,
         signUp,
         clearMustSetPassword,
@@ -304,6 +359,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         resetPassword,
         inviteUser,
         setUserStatus,
+        setUserRole,
         isAdmin,
         isManager,
         isAdminOrManager,

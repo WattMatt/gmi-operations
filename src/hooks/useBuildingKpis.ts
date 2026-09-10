@@ -29,9 +29,15 @@ export interface OhsAction {
 }
 export interface SectionScore { section_no: string; section_title: string | null; section_pct: number | null }
 
-async function latestApproved(buildingId: string, type: string) {
+/**
+ * The newest APPROVED report of a type for a building. Dashboards and KPI cards
+ * read from this, so a half-filled draft or a rejected report can never become the
+ * building's headline numbers (finding K1). Exported for the unit test and for
+ * other readers of approved reports.
+ */
+export async function latestApprovedReport(buildingId: string, type: string) {
   const rows = await fdb.from('reports').select('*')
-    .eq('building_id', buildingId).eq('report_type', type)
+    .eq('building_id', buildingId).eq('report_type', type).eq('status', 'approved')
     .order('report_period', { ascending: false }).limit(1);
   return rows.data?.[0] ?? null;
 }
@@ -43,9 +49,9 @@ export function useBuildingKpis(buildingId: string | undefined) {
     queryFn: async () => {
       const bid = buildingId!;
       const [ops, cm, annual] = await Promise.all([
-        latestApproved(bid, 'ops_monthly'),
-        latestApproved(bid, 'cm_monthly'),
-        latestApproved(bid, 'annual_inspection'),
+        latestApprovedReport(bid, 'ops_monthly'),
+        latestApprovedReport(bid, 'cm_monthly'),
+        latestApprovedReport(bid, 'annual_inspection'),
       ]);
 
       const kpis: Kpi[] = [];
@@ -161,7 +167,7 @@ export function useBuildingKpis(buildingId: string | undefined) {
       }
 
       // trend across all approved ops reports
-      const allOps = await fdb.from('reports').select('id,report_period').eq('building_id', bid).eq('report_type', 'ops_monthly').order('report_period');
+      const allOps = await fdb.from('reports').select('id,report_period').eq('building_id', bid).eq('report_type', 'ops_monthly').eq('status', 'approved').order('report_period');
       const trendRows = await Promise.all((allOps.data ?? []).map(async (r) => {
         const s = await fdb.from('compliance_scores').select('compliance_pct').eq('report_id', r.id);
         return { period: r.report_period as string, pct: num(s.data?.[0]?.compliance_pct ?? null) };
@@ -229,7 +235,7 @@ export function useBuildingKpis(buildingId: string | undefined) {
         // reports. Needs ≥2 periods → null for a single report. See totalFootfall() for how the mix of
         // per-entrance and roll-up rows is collapsed to one non-double-counted total.
         const cmReports = await fdb.from('reports').select('id,report_period')
-          .eq('building_id', bid).eq('report_type', 'cm_monthly').order('report_period');
+          .eq('building_id', bid).eq('report_type', 'cm_monthly').eq('status', 'approved').order('report_period');
         const footfallByPeriod = await Promise.all((cmReports.data ?? []).map(async (r) => {
           const ff = await fdb.from('footfall_counts').select('entrance,month_count').eq('report_id', r.id);
           const rows = (ff.data ?? []) as { entrance: string | null; month_count: number | null }[];

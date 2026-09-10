@@ -6,22 +6,21 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Progress } from '@/components/ui/progress';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import {
   ChevronLeft,
   ChevronRight,
   Calendar,
-  Clock,
-  CheckCircle2,
   AlertTriangle,
-  Camera,
   Loader2,
   RefreshCw,
-  User,
   Plus,
-  ClipboardCheck,
+  UserPlus,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { categoryMeta } from '@/lib/compliance';
+import { useBuildingMembers, memberDisplayName } from '@/hooks/useBuildingMembers';
+import { AssigneePicker } from '@/components/people/AssigneePicker';
+import { notify } from '@/lib/notify';
 import {
   format,
   startOfDay,
@@ -46,28 +45,7 @@ import {
 } from 'date-fns';
 import ReportIssueDialog from '@/components/checklists/ReportIssueDialog';
 import CompleteTaskDialog from '@/components/checklists/CompleteTaskDialog';
-
-type TaskFrequency = 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'annually';
-type TaskStatus = 'pending' | 'completed' | 'overdue' | 'issue_logged';
-
-interface TaskInstance {
-  id: string;
-  task_name: string;
-  task_description: string | null;
-  frequency: TaskFrequency;
-  status: TaskStatus;
-  due_date: string;
-  requires_photo: boolean;
-  requires_signature: boolean;
-  responsible_role: string;
-  building_id: string;
-  category: string | null;
-  completion?: {
-    completed_by: string;
-    completed_at: string;
-    completed_by_name?: string;
-  };
-}
+import { TasksList, type TaskInstance, type TaskFrequency, type TaskStatus } from '@/components/building/TasksList';
 
 interface ChecklistsTabProps {
   buildingId: string;
@@ -80,13 +58,6 @@ const frequencyLabels: Record<TaskFrequency, string> = {
   monthly: 'Monthly',
   quarterly: 'Quarterly',
   annually: 'Annual',
-};
-
-const statusColors: Record<TaskStatus, string> = {
-  pending: 'bg-warning text-warning-foreground',
-  completed: 'bg-success text-success-foreground',
-  overdue: 'bg-destructive text-destructive-foreground',
-  issue_logged: 'bg-destructive/80 text-destructive-foreground',
 };
 
 function getDueDateForFrequency(frequency: TaskFrequency): string {
@@ -151,7 +122,8 @@ function getCurrentPeriodRange(frequency: TaskFrequency): { start: Date; end: Da
 }
 
 export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTabProps) {
-  const { isAdminOrManager } = useAuth();
+  const { user, isAdminOrManager } = useAuth();
+  const { byId: members } = useBuildingMembers(buildingId);
   const [tasks, setTasks] = useState<TaskInstance[]>([]);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -163,6 +135,24 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
   const [completeDialogOpen, setCompleteDialogOpen] = useState(false);
   const [selectedTask, setSelectedTask] = useState<TaskInstance | null>(null);
 
+  const nameOf = (id: string | null) => (id && members.get(id) ? memberDisplayName(members.get(id)!) : null);
+
+  const assignTasks = async (taskIds: string[], assigned_to: string | null) => {
+    if (!taskIds.length) return;
+    const { data, error } = await supabase.from('task_instances').update({ assigned_to }).in('id', taskIds).select('id');
+    if (error) { toast.error(`Could not assign: ${error.message}`); return; }
+    if ((data?.length ?? 0) < taskIds.length) toast.error(`Only ${data?.length ?? 0} of ${taskIds.length} tasks could be assigned.`);
+    else toast.success(assigned_to ? `Assigned ${taskIds.length} task${taskIds.length === 1 ? '' : 's'} to ${nameOf(assigned_to) ?? 'user'}` : 'Unassigned');
+    if (assigned_to && assigned_to !== user?.id && data?.length) {
+      void notify({ kind: 'task_assigned', entityType: 'task', entityId: data[0].id, buildingId, recipients: [assigned_to], title: `${data.length} task${data.length === 1 ? '' : 's'} assigned to you at ${buildingName ?? 'a building'}`, url: `/buildings/${buildingId}?tab=checklists` });
+    }
+    const landed = new Set((data ?? []).map((r) => r.id));
+    setTasks((prev) => prev.map((t) => (landed.has(t.id) ? { ...t, assigned_to } : t)));
+  };
+
+  const canAssignTask = (task: TaskInstance) => isAdminOrManager || task.assigned_to === user?.id;
+  const onAssignTask = (task: TaskInstance, userId: string | null) => assignTasks([task.id], userId);
+
   useEffect(() => {
     fetchTasks();
   }, [buildingId]);
@@ -171,7 +161,8 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
     setLoading(true);
     try {
       // Fetch tasks with their completions
-      const { data: tasksData, error: tasksError } = await supabase
+      // `assigned_to` is not in the generated types until the migration ships; narrow at the boundary.
+      const { data: tasksRaw, error: tasksError } = await supabase
         .from('task_instances')
         .select(`
           id,
@@ -184,12 +175,15 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
           requires_signature,
           responsible_role,
           building_id,
-          category
+          category,
+          assigned_to
         `)
         .eq('building_id', buildingId)
         .order('due_date');
 
       if (tasksError) throw tasksError;
+
+      const tasksData = tasksRaw as unknown as Array<Omit<TaskInstance, 'completion'>> | null;
 
       // Fetch completions for these tasks
       const taskIds = (tasksData || []).map(t => t.id);
@@ -204,23 +198,14 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
 
       if (completionsError) throw completionsError;
 
-      // Fetch profile names for completions
-      const userIds = [...new Set((completionsData || []).map(c => c.completed_by))];
-      const { data: profilesData } = await supabase
-        .from('profiles')
-        .select('id, full_name, email')
-        .in('id', userIds);
-
-      const profileMap = new Map((profilesData || []).map(p => [p.id, p.full_name || p.email]));
-
-      // Map completions to tasks
+      // Map completions to tasks. The completer's name is resolved at render time from the
+      // building's member list (`nameOf`) — other users' `profiles` rows are not readable here.
       const completionMap = new Map(
         (completionsData || []).map(c => [
           c.task_instance_id,
           {
             completed_by: c.completed_by,
             completed_at: c.completed_at,
-            completed_by_name: profileMap.get(c.completed_by) || 'Unknown',
           },
         ])
       );
@@ -463,21 +448,34 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
               <span className="font-medium">{getPeriodLabel(selectedFrequency)}</span>
               <Badge variant="outline" className="text-xs">Current Period</Badge>
             </div>
-            {isAdminOrManager && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={handleGenerateTasks}
-                disabled={generating}
-              >
-                {generating ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : (
-                  <Plus className="h-4 w-4 mr-2" />
-                )}
-                Generate {frequencyLabels[selectedFrequency]}
-              </Button>
-            )}
+            <div className="flex items-center gap-2">
+              {isAdminOrManager && pendingTasks.length > 0 && (
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button variant="outline" size="sm"><UserPlus className="mr-2 h-4 w-4" />Assign all pending</Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-72 space-y-2">
+                    <p className="text-sm">Assign the {pendingTasks.length} pending {frequencyLabels[selectedFrequency].toLowerCase()} tasks to:</p>
+                    <AssigneePicker buildingId={buildingId} value={null} onChange={(id) => id && assignTasks(pendingTasks.map((t) => t.id), id)} allowUnassigned={false} placeholder="Choose a person" />
+                  </PopoverContent>
+                </Popover>
+              )}
+              {isAdminOrManager && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleGenerateTasks}
+                  disabled={generating}
+                >
+                  {generating ? (
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                  ) : (
+                    <Plus className="h-4 w-4 mr-2" />
+                  )}
+                  Generate {frequencyLabels[selectedFrequency]}
+                </Button>
+              )}
+            </div>
           </div>
 
           {/* Progress Card */}
@@ -619,6 +617,10 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
                   onReportIssue={handleReportIssue}
                   emptyMessage={`No ${frequencyLabels[selectedFrequency].toLowerCase()} tasks scheduled. Click "Generate ${frequencyLabels[selectedFrequency]}" to create tasks.`}
                   showDueDate
+                  buildingId={buildingId}
+                  nameOf={nameOf}
+                  canAssign={canAssignTask}
+                  onAssign={onAssignTask}
                 />
               </CardContent>
             </Card>
@@ -640,6 +642,10 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
                   onReportIssue={handleReportIssue}
                   variant="issue"
                   showDueDate
+                  buildingId={buildingId}
+                  nameOf={nameOf}
+                  canAssign={canAssignTask}
+                  onAssign={onAssignTask}
                 />
               </CardContent>
             </Card>
@@ -671,125 +677,6 @@ export default function ChecklistsTab({ buildingId, buildingName }: ChecklistsTa
           />
         </>
       )}
-    </div>
-  );
-}
-
-// Sub-component for task lists
-interface TasksListProps {
-  tasks: TaskInstance[];
-  onComplete: (task: TaskInstance) => void;
-  onReportIssue: (task: TaskInstance) => void;
-  emptyMessage?: string;
-  variant?: 'default' | 'issue';
-  showDueDate?: boolean;
-}
-
-function TasksList({ tasks, onComplete, onReportIssue, emptyMessage, variant = 'default', showDueDate = false }: TasksListProps) {
-  if (tasks.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center py-8 text-center">
-        <ClipboardCheck className="h-10 w-10 text-muted-foreground mb-3" />
-        <p className="text-sm text-muted-foreground">{emptyMessage || 'No tasks'}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-3 max-h-[400px] overflow-y-auto">
-      {tasks.map(task => (
-        <div
-          key={task.id}
-          className={`p-3 rounded-lg border ${
-            variant === 'issue'
-              ? 'border-destructive/50 bg-destructive/5'
-              : task.status === 'completed'
-              ? 'bg-muted/30'
-              : ''
-          }`}
-        >
-          <div className="flex items-start gap-3">
-            {task.status === 'completed' ? (
-              <CheckCircle2 className="h-5 w-5 text-success mt-0.5 shrink-0" />
-            ) : task.status === 'issue_logged' ? (
-              <AlertTriangle className="h-5 w-5 text-destructive mt-0.5 shrink-0" />
-            ) : (
-              <Clock className="h-5 w-5 text-warning mt-0.5 shrink-0" />
-            )}
-            <div className="flex-1 min-w-0">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <p
-                    className={`font-medium text-sm ${
-                      task.status === 'completed' ? 'line-through text-muted-foreground' : ''
-                    }`}
-                  >
-                    {task.task_name}
-                  </p>
-                  {task.task_description && (
-                    <p className="text-xs text-muted-foreground mt-0.5">{task.task_description}</p>
-                  )}
-                  {categoryMeta(task.category) && (
-                    <Badge variant="outline" className={`mt-1 ${categoryMeta(task.category)!.color}`}>
-                      {categoryMeta(task.category)!.label}
-                    </Badge>
-                  )}
-                  {showDueDate && (
-                    <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
-                      <Calendar className="h-3 w-3" />
-                      Due: {format(new Date(task.due_date), 'MMM d, yyyy')}
-                    </p>
-                  )}
-                </div>
-                <Badge
-                  variant={task.status === 'completed' ? 'secondary' : 'outline'}
-                  className={`shrink-0 ${task.status === 'completed' ? statusColors.completed : ''}`}
-                >
-                  {task.status === 'completed'
-                    ? 'Done'
-                    : task.status === 'issue_logged'
-                    ? 'Issue'
-                    : 'Pending'}
-                </Badge>
-              </div>
-
-              {/* Completed by info */}
-              {task.completion && (
-                <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
-                  <User className="h-3 w-3" />
-                  {task.completion.completed_by_name} •{' '}
-                  {format(new Date(task.completion.completed_at), 'MMM d, h:mm a')}
-                </p>
-              )}
-
-              {/* Actions for pending tasks */}
-              {task.status === 'pending' && (
-                <div className="flex items-center gap-2 mt-2">
-                  <Button size="sm" className="h-7 text-xs" onClick={() => onComplete(task)}>
-                    <CheckCircle2 className="h-3 w-3 mr-1" />
-                    Complete
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    onClick={() => onReportIssue(task)}
-                  >
-                    <AlertTriangle className="h-3 w-3 mr-1" />
-                    Issue
-                  </Button>
-                  {task.requires_photo && (
-                    <Badge variant="outline" className="text-xs gap-1">
-                      <Camera className="h-3 w-3" />
-                      Photo
-                    </Badge>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      ))}
     </div>
   );
 }

@@ -5,6 +5,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { AuthProvider } from "@/contexts/AuthContext";
+import { HintsProvider } from "@/hooks/useHints";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { OrganizationThemeProvider } from "@/components/OrganizationThemeProvider";
 import ProtectedRoute from "@/components/ProtectedRoute";
@@ -16,7 +17,8 @@ import Auth from "./pages/Auth";
 import SetPassword from "./pages/SetPassword";
 import ResetPassword from "./pages/ResetPassword";
 import Onboarding from "./pages/Onboarding";
-import Dashboard from "./pages/Dashboard";
+import RoleHome from "./pages/RoleHome";
+import MyDay from "./pages/MyDay";
 import Buildings from "./pages/Buildings";
 import BuildingForm from "./pages/BuildingForm";
 import BuildingDetails from "./pages/BuildingDetails";
@@ -26,8 +28,10 @@ import NewIssue from "./pages/NewIssue";
 import MapView from "./pages/MapView";
 import Reports from "./pages/Reports";
 import FortressReportEditor from "./components/reports/fortress/FortressReportEditor";
+import FortressReports from "./pages/FortressReports";
 import FormsLibrary from "./pages/FormsLibrary";
 import MySignoffs from "./pages/MySignoffs";
+import Inbox from "./pages/Inbox";
 import UserManagement from "./pages/UserManagement";
 import Settings from "./pages/Settings";
 import Profile from "./pages/Profile";
@@ -42,6 +46,7 @@ const App = () => (
         <Sonner />
         <BrowserRouter>
           <AuthProvider>
+            <HintsProvider>
             <OrganizationThemeProvider>
             <Routes>
               {/* Public routes (outside ProtectedRoute) */}
@@ -53,9 +58,15 @@ const App = () => (
               <Route path="/onboarding" element={<Onboarding />} />
 
             {/* Protected Routes with Dashboard Layout */}
+            {/* `/` is role-shaped: site roles land on My Day, managers on the dashboard. */}
             <Route path="/" element={
               <ProtectedRoute>
-                <DashboardLayout><Dashboard /></DashboardLayout>
+                <DashboardLayout><RoleHome /></DashboardLayout>
+              </ProtectedRoute>
+            } />
+            <Route path="/my-day" element={
+              <ProtectedRoute>
+                <DashboardLayout><MyDay /></DashboardLayout>
               </ProtectedRoute>
             } />
             <Route path="/buildings" element={
@@ -103,6 +114,12 @@ const App = () => (
                 <DashboardLayout><Reports /></DashboardLayout>
               </ProtectedRoute>
             } />
+            {/* Static path first so it is never captured by the :id route below. */}
+            <Route path="/reports/fortress" element={
+              <ProtectedRoute>
+                <DashboardLayout><FortressReports /></DashboardLayout>
+              </ProtectedRoute>
+            } />
             <Route path="/reports/fortress/:id" element={
               <ProtectedRoute>
                 <DashboardLayout><FortressReportEditor /></DashboardLayout>
@@ -116,6 +133,11 @@ const App = () => (
             <Route path="/my-signoffs" element={
               <ProtectedRoute>
                 <DashboardLayout><MySignoffs /></DashboardLayout>
+              </ProtectedRoute>
+            } />
+            <Route path="/inbox" element={
+              <ProtectedRoute>
+                <DashboardLayout><Inbox /></DashboardLayout>
               </ProtectedRoute>
             } />
             <Route path="/users" element={
@@ -137,6 +159,7 @@ const App = () => (
             <Route path="*" element={<NotFound />} />
             </Routes>
             </OrganizationThemeProvider>
+            </HintsProvider>
           </AuthProvider>
         </BrowserRouter>
       </TooltipProvider>
